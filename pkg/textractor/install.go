@@ -157,7 +157,7 @@ func extractEmbeddedTarGz(ctx context.Context, data []byte, dest string) error {
 				return fmt.Errorf("create dir %s: %w", target, err)
 			}
 
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("create parent dir %s: %w", filepath.Dir(target), err)
 			}

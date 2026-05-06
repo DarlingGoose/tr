@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,8 +47,13 @@ type Client struct {
 
 	lines  chan *Line
 	errs   chan error
-	hookMu sync.Mutex
+	hookMu sync.RWMutex
 	hooks  map[string]string
+
+	hookHistoryLimit int
+	hookHistory      map[string][]*Line
+	hookSubscribers  map[uint64]hookSubscriber
+	nextHookSubID    uint64
 }
 
 type ClientOptions struct {
@@ -57,7 +63,18 @@ type ClientOptions struct {
 	RootDir    string
 	Arch       Arch
 	Logger     *slog.Logger
+
+	// HookHistoryLimit controls how many previous lines are retained for each
+	// hook group. Values <= 0 use the default limit.
+	HookHistoryLimit int
 }
+
+type hookSubscriber struct {
+	group string
+	ch    chan *Line
+}
+
+const defaultHookHistoryLimit = 500
 
 func NewClient(opts ClientOptions) (*Client, error) {
 	if opts.WinePrefix == "" {
@@ -80,6 +97,9 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if opts.Arch != ArchX86 && opts.Arch != ArchX64 {
 		return nil, fmt.Errorf("unsupported arch %q", opts.Arch)
 	}
+	if opts.HookHistoryLimit <= 0 {
+		opts.HookHistoryLimit = defaultHookHistoryLimit
+	}
 
 	root := opts.RootDir
 	if root == "" {
@@ -87,15 +107,18 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	}
 
 	return &Client{
-		WinePath:   opts.WinePath,
-		WinePrefix: opts.WinePrefix,
-		WineUser:   opts.WineUser,
-		RootDir:    root,
-		Arch:       opts.Arch,
-		Logger:     opts.Logger,
-		lines:      make(chan *Line, 256),
-		errs:       make(chan error, 16),
-		hooks:      make(map[string]string),
+		WinePath:         opts.WinePath,
+		WinePrefix:       opts.WinePrefix,
+		WineUser:         opts.WineUser,
+		RootDir:          root,
+		Arch:             opts.Arch,
+		Logger:           opts.Logger,
+		lines:            make(chan *Line, 256),
+		errs:             make(chan error, 16),
+		hooks:            make(map[string]string),
+		hookHistoryLimit: opts.HookHistoryLimit,
+		hookHistory:      make(map[string][]*Line),
+		hookSubscribers:  make(map[uint64]hookSubscriber),
 	}, nil
 }
 
@@ -234,9 +257,110 @@ func (c *Client) Command(ctx context.Context, command string) error {
 }
 
 func (c *Client) Hooks() map[string]string {
+	c.hookMu.RLock()
+	defer c.hookMu.RUnlock()
+
+	hooks := make(map[string]string, len(c.hooks))
+	for hook, text := range c.hooks {
+		hooks[hook] = text
+	}
+	return hooks
+}
+
+func (c *Client) HookGroups() []string {
+	c.hookMu.RLock()
+	defer c.hookMu.RUnlock()
+
+	groups := make([]string, 0, len(c.hookHistory))
+	for group := range c.hookHistory {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func (c *Client) HookHistory(group string) []*Line {
+	group = HookGroup(group)
+
+	c.hookMu.RLock()
+	defer c.hookMu.RUnlock()
+
+	lines := c.hookHistory[group]
+	history := make([]*Line, 0, len(lines))
+	for _, line := range lines {
+		history = append(history, line.Clone())
+	}
+	return history
+}
+
+func (c *Client) HookHistories() map[string][]*Line {
+	c.hookMu.RLock()
+	defer c.hookMu.RUnlock()
+
+	histories := make(map[string][]*Line, len(c.hookHistory))
+	for group, lines := range c.hookHistory {
+		history := make([]*Line, 0, len(lines))
+		for _, line := range lines {
+			history = append(history, line.Clone())
+		}
+		histories[group] = history
+	}
+	return histories
+}
+
+func (c *Client) HookFeed(ctx context.Context, group string, replayHistory bool) <-chan *Line {
+	group = HookGroup(group)
+	out := make(chan *Line, 256)
+
 	c.hookMu.Lock()
-	defer c.hookMu.Unlock()
-	return c.hooks
+	if replayHistory {
+		if group == "" {
+			groups := make([]string, 0, len(c.hookHistory))
+			for group := range c.hookHistory {
+				groups = append(groups, group)
+			}
+			sort.Strings(groups)
+
+		replayAll:
+			for _, group := range groups {
+				for _, line := range c.hookHistory[group] {
+					select {
+					case out <- line.Clone():
+					default:
+						break replayAll
+					}
+				}
+			}
+		} else {
+		replayGroup:
+			for _, line := range c.hookHistory[group] {
+				select {
+				case out <- line.Clone():
+				default:
+					break replayGroup
+				}
+			}
+		}
+	}
+
+	id := c.nextHookSubID
+	c.nextHookSubID++
+	c.hookSubscribers[id] = hookSubscriber{
+		group: group,
+		ch:    out,
+	}
+	c.hookMu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+
+		c.hookMu.Lock()
+		delete(c.hookSubscribers, id)
+		close(out)
+		c.hookMu.Unlock()
+	}()
+
+	return out
 }
 
 func (c *Client) RawLines() <-chan *Line {
@@ -244,7 +368,7 @@ func (c *Client) RawLines() <-chan *Line {
 }
 
 func (c *Client) LinesFiltered(filter HookFilter) <-chan *Line {
-	return SpeakerMergedLines(FilterLines(c.lines, filter))
+	return FilterLines(SpeakerMergedLines(c.lines), filter)
 }
 
 func (c *Client) Lines() <-chan *Line {
@@ -324,9 +448,7 @@ func (c *Client) readOutput(r io.Reader) {
 					slog.Error("invalid line", "err", err, "l", line)
 					continue
 				}
-				c.hookMu.Lock()
-				c.hooks[l.Hook] = l.Text
-				c.hookMu.Unlock()
+				c.recordHookLine(&l)
 				select {
 				case c.lines <- &l:
 				default:
@@ -349,6 +471,44 @@ func (c *Client) readOutput(r io.Reader) {
 				c.pushErr(fmt.Errorf("read TextractorCLI stdout: %w", err))
 			}
 			return
+		}
+	}
+}
+
+func (c *Client) recordHookLine(line *Line) {
+	if line == nil {
+		return
+	}
+
+	stored := line.Clone()
+	group := stored.HookGroup()
+	if group == "" {
+		return
+	}
+
+	c.hookMu.Lock()
+	defer c.hookMu.Unlock()
+
+	c.hooks[stored.Hook] = stored.Text
+
+	history := append(c.hookHistory[group], stored)
+	if len(history) > c.hookHistoryLimit {
+		copy(history, history[len(history)-c.hookHistoryLimit:])
+		history = history[:c.hookHistoryLimit]
+	}
+	c.hookHistory[group] = history
+
+	for _, sub := range c.hookSubscribers {
+		if sub.group != "" && sub.group != group {
+			continue
+		}
+
+		select {
+		case sub.ch <- stored.Clone():
+		default:
+			if c.Logger != nil {
+				c.Logger.Warn("dropping hook feed line; channel full", "hook_group", group)
+			}
 		}
 	}
 }
