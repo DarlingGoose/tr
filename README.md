@@ -121,6 +121,24 @@ client, err := textractor.NewClient(textractor.ClientOptions{
 })
 ```
 
+Persist selected hook histories in the background with JSONL files under the
+game directory's `logs` folder:
+
+```go
+client, err := textractor.NewClient(textractor.ClientOptions{
+	WinePrefix: prefix,
+	Arch:       textractor.ArchX86,
+	HookHistoryLog: textractor.HookHistoryLogOptions{
+		Enabled: true,
+		GameDir: filepath.Dir(gameExe),
+		Groups:  []string{"@13F548:Game.exe"},
+	},
+})
+```
+
+Pass no `Groups` to persist every hook group. Set `Dir` to override the output
+directory.
+
 Inspect known hook groups:
 
 ```go

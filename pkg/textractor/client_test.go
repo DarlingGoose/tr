@@ -2,6 +2,9 @@ package textractor
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -86,6 +89,60 @@ func TestHookFeedReplaysAndStreamsSelectedGroup(t *testing.T) {
 	cancel()
 	if _, ok := <-feed; ok {
 		t.Fatal("expected feed to close after cancel")
+	}
+}
+
+func TestHookHistoryLogWritesSelectedGroupsUnderGameLogs(t *testing.T) {
+	gameDir := t.TempDir()
+	client, err := NewClient(ClientOptions{
+		WinePrefix:       t.TempDir(),
+		HookHistoryLimit: 10,
+		HookHistoryLog: HookHistoryLogOptions{
+			Enabled: true,
+			GameDir: gameDir,
+			Groups:  []string{"@dialogue.dll:1234"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.recordHookLine(&Line{Hook: "Thread A@dialogue.dll:1234", Speaker: "Alice", Text: "kept"})
+	client.recordHookLine(&Line{Hook: "Thread B@names.dll:9999", Text: "ignored"})
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(gameDir, "logs", "dialogue.dll_1234.jsonl")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var entry hookHistoryLogEntry
+	if err := json.Unmarshal(data[:len(data)-1], &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.HookGroup != "@dialogue.dll:1234" || entry.Speaker != "Alice" || entry.Text != "kept" {
+		t.Fatalf("unexpected log entry: %#v", entry)
+	}
+
+	ignoredPath := filepath.Join(gameDir, "logs", "names.dll_9999.jsonl")
+	if _, err := os.Stat(ignoredPath); !os.IsNotExist(err) {
+		t.Fatalf("expected ignored group not to be logged, stat err: %v", err)
+	}
+}
+
+func TestHookHistoryLogRequiresDirectory(t *testing.T) {
+	_, err := NewClient(ClientOptions{
+		WinePrefix: t.TempDir(),
+		HookHistoryLog: HookHistoryLogOptions{
+			Enabled: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing hook history log directory error")
 	}
 }
 

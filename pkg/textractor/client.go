@@ -1,7 +1,6 @@
 package textractor
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +52,7 @@ type Client struct {
 	hookHistory      map[string][]*Line
 	hookSubscribers  map[uint64]hookSubscriber
 	nextHookSubID    uint64
+	hookHistoryLog   *hookHistoryLogger
 }
 
 type ClientOptions struct {
@@ -67,11 +66,29 @@ type ClientOptions struct {
 	// HookHistoryLimit controls how many previous lines are retained for each
 	// hook group. Values <= 0 use the default limit.
 	HookHistoryLimit int
+
+	// HookHistoryLog controls optional asynchronous persistence of hook history
+	// lines. When enabled with GameDir and no Dir, logs are written under
+	// GameDir/logs.
+	HookHistoryLog HookHistoryLogOptions
 }
 
-type hookSubscriber struct {
-	group string
-	ch    chan *Line
+type HookHistoryLogOptions struct {
+	Enabled bool
+
+	// GameDir is the game installation directory. If Dir is empty, hook history
+	// logs are written under GameDir/logs.
+	GameDir string
+
+	// Dir overrides the output directory for hook history logs.
+	Dir string
+
+	// Groups limits persistence to these hook groups. Empty means all groups.
+	Groups []string
+
+	// Buffer controls the background logging queue size. Values <= 0 use the
+	// default buffer.
+	Buffer int
 }
 
 const defaultHookHistoryLimit = 500
@@ -106,7 +123,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		root = filepath.Join(opts.WinePrefix, "drive_c", "users", opts.WineUser, "Desktop", "Textractor")
 	}
 
-	return &Client{
+	client := &Client{
 		WinePath:         opts.WinePath,
 		WinePrefix:       opts.WinePrefix,
 		WineUser:         opts.WineUser,
@@ -119,7 +136,15 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		hookHistoryLimit: opts.HookHistoryLimit,
 		hookHistory:      make(map[string][]*Line),
 		hookSubscribers:  make(map[uint64]hookSubscriber),
-	}, nil
+	}
+
+	hookHistoryLog, err := newHookHistoryLogger(opts.HookHistoryLog, opts.Logger, client.pushErr)
+	if err != nil {
+		return nil, err
+	}
+	client.hookHistoryLog = hookHistoryLog
+
+	return client, nil
 }
 
 func (c *Client) CLIPath() string {
@@ -267,102 +292,6 @@ func (c *Client) Hooks() map[string]string {
 	return hooks
 }
 
-func (c *Client) HookGroups() []string {
-	c.hookMu.RLock()
-	defer c.hookMu.RUnlock()
-
-	groups := make([]string, 0, len(c.hookHistory))
-	for group := range c.hookHistory {
-		groups = append(groups, group)
-	}
-	sort.Strings(groups)
-	return groups
-}
-
-func (c *Client) HookHistory(group string) []*Line {
-	group = HookGroup(group)
-
-	c.hookMu.RLock()
-	defer c.hookMu.RUnlock()
-
-	lines := c.hookHistory[group]
-	history := make([]*Line, 0, len(lines))
-	for _, line := range lines {
-		history = append(history, line.Clone())
-	}
-	return history
-}
-
-func (c *Client) HookHistories() map[string][]*Line {
-	c.hookMu.RLock()
-	defer c.hookMu.RUnlock()
-
-	histories := make(map[string][]*Line, len(c.hookHistory))
-	for group, lines := range c.hookHistory {
-		history := make([]*Line, 0, len(lines))
-		for _, line := range lines {
-			history = append(history, line.Clone())
-		}
-		histories[group] = history
-	}
-	return histories
-}
-
-func (c *Client) HookFeed(ctx context.Context, group string, replayHistory bool) <-chan *Line {
-	group = HookGroup(group)
-	out := make(chan *Line, 256)
-
-	c.hookMu.Lock()
-	if replayHistory {
-		if group == "" {
-			groups := make([]string, 0, len(c.hookHistory))
-			for group := range c.hookHistory {
-				groups = append(groups, group)
-			}
-			sort.Strings(groups)
-
-		replayAll:
-			for _, group := range groups {
-				for _, line := range c.hookHistory[group] {
-					select {
-					case out <- line.Clone():
-					default:
-						break replayAll
-					}
-				}
-			}
-		} else {
-		replayGroup:
-			for _, line := range c.hookHistory[group] {
-				select {
-				case out <- line.Clone():
-				default:
-					break replayGroup
-				}
-			}
-		}
-	}
-
-	id := c.nextHookSubID
-	c.nextHookSubID++
-	c.hookSubscribers[id] = hookSubscriber{
-		group: group,
-		ch:    out,
-	}
-	c.hookMu.Unlock()
-
-	go func() {
-		<-ctx.Done()
-
-		c.hookMu.Lock()
-		delete(c.hookSubscribers, id)
-		close(out)
-		c.hookMu.Unlock()
-	}()
-
-	return out
-}
-
 func (c *Client) RawLines() <-chan *Line {
 	return c.lines
 }
@@ -414,202 +343,14 @@ func (c *Client) Close() error {
 		}
 	}
 
+	if c.hookHistoryLog != nil {
+		if err := c.hookHistoryLog.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
-}
-
-func (c *Client) readOutput(r io.Reader) {
-	defer close(c.lines)
-
-	// TextractorCLI output may come in UTF-16LE chunks.
-	// Read raw chunks and decode.
-	br := bufio.NewReader(r)
-
-	var pending []byte
-
-	for {
-		chunk := make([]byte, 4096)
-		n, err := br.Read(chunk)
-		if n > 0 {
-			pending = append(pending, chunk[:n]...)
-
-			text := decodeLikelyText(pending)
-			lines, keep := splitCompleteLines(text)
-
-			for _, line := range lines {
-				line = strings.TrimRight(line, "\r\n")
-				if strings.TrimSpace(line) == "" {
-					continue
-				}
-				l, err := ParseTextractorLine(line)
-				if err != nil {
-					slog.Error("invalid line", "err", err, "l", line)
-					continue
-				}
-				c.recordHookLine(&l)
-				select {
-				case c.lines <- &l:
-				default:
-					if c.Logger != nil {
-						c.Logger.Warn("dropping textractor output line; channel full")
-					}
-				}
-			}
-
-			// This is intentionally simple. For production, keep undecoded trailing bytes.
-			if keep == "" {
-				pending = pending[:0]
-			} else {
-				pending = utf16LEBytes(keep)
-			}
-		}
-
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				c.pushErr(fmt.Errorf("read TextractorCLI stdout: %w", err))
-			}
-			return
-		}
-	}
-}
-
-func (c *Client) recordHookLine(line *Line) {
-	if line == nil {
-		return
-	}
-
-	stored := line.Clone()
-	group := stored.HookGroup()
-	if group == "" {
-		return
-	}
-
-	c.hookMu.Lock()
-	defer c.hookMu.Unlock()
-
-	c.hooks[stored.Hook] = stored.Text
-
-	history := append(c.hookHistory[group], stored)
-	if len(history) > c.hookHistoryLimit {
-		copy(history, history[len(history)-c.hookHistoryLimit:])
-		history = history[:c.hookHistoryLimit]
-	}
-	c.hookHistory[group] = history
-
-	for _, sub := range c.hookSubscribers {
-		if sub.group != "" && sub.group != group {
-			continue
-		}
-
-		select {
-		case sub.ch <- stored.Clone():
-		default:
-			if c.Logger != nil {
-				c.Logger.Warn("dropping hook feed line; channel full", "hook_group", group)
-			}
-		}
-	}
-}
-
-func (c *Client) readStderr(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		if c.Logger != nil {
-			c.Logger.Debug("textractor stderr", "line", line)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		c.pushErr(fmt.Errorf("read TextractorCLI stderr: %w", err))
-	}
-}
-
-func (c *Client) wait() {
-	err := c.cmd.Wait()
-
-	c.mu.Lock()
-	c.started = false
-	c.mu.Unlock()
-
-	if err != nil && !isExpectedProcessExit(err) {
-		c.pushErr(fmt.Errorf("TextractorCLI exited: %w", err))
-	}
-}
-
-func (c *Client) pushErr(err error) {
-	select {
-	case c.errs <- err:
-	default:
-		if c.Logger != nil {
-			c.Logger.Warn("dropping textractor error; channel full", "error", err)
-		}
-	}
-}
-
-func decodeLikelyText(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	if looksUTF16LE(b) {
-		return decodeUTF16LEBytes(b)
-	}
-	return string(b)
-}
-
-func splitCompleteLines(s string) ([]string, string) {
-	if s == "" {
-		return nil, ""
-	}
-
-	parts := strings.SplitAfter(s, "\n")
-	if len(parts) == 0 {
-		return nil, ""
-	}
-
-	var lines []string
-	for _, p := range parts {
-		if strings.HasSuffix(p, "\n") {
-			lines = append(lines, p)
-		} else {
-			return lines, p
-		}
-	}
-
-	return lines, ""
-}
-
-func isExpectedProcessExit(err error) bool {
-	if err == nil {
-		return true
-	}
-	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr)
-}
-
-func appendCleanEnv(extra ...string) []string {
-	env := os.Environ()
-
-	// Remove existing values for keys we are overriding.
-	for _, e := range extra {
-		k, _, ok := strings.Cut(e, "=")
-		if !ok {
-			continue
-		}
-
-		dst := env[:0]
-		prefix := k + "="
-		for _, existing := range env {
-			if !strings.HasPrefix(existing, prefix) {
-				dst = append(dst, existing)
-			}
-		}
-		env = dst
-	}
-
-	return append(env, extra...)
 }
