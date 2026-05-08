@@ -1,7 +1,6 @@
 package textractor
 
 import (
-	"errors"
 	"regexp"
 	"strings"
 	"unicode/utf16"
@@ -11,6 +10,7 @@ import (
 var textractorLineRE = regexp.MustCompile(`^(?:TEXT:\s*)?\[([^\]]+)\]\s*(.*)$`)
 
 type Line struct {
+	Raw     string
 	Hook    string
 	Text    string
 	Speaker string
@@ -51,13 +51,16 @@ func ParseTextractorLine(raw string) (Line, error) {
 
 	m := textractorLineRE.FindStringSubmatch(line)
 	if m == nil {
-		return Line{}, errors.New("line does not match textractor format: " + line)
+		return Line{
+			Raw: raw,
+		}, nil
 	}
 
 	text := CollapseAdjacentDuplicateRunes(strings.TrimSpace(m[2]))
 	return Line{
 		Hook: strings.TrimSpace(m[1]),
 		Text: text,
+		Raw:  raw,
 	}, nil
 }
 
