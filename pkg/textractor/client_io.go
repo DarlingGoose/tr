@@ -26,10 +26,9 @@ func (c *Client) readOutput(r io.Reader) {
 		if n > 0 {
 			pending = append(pending, chunk[:n]...)
 
-			text := decodeLikelyText(pending)
-			lines, keep := splitCompleteLines(text)
-
-			for _, line := range lines {
+			lines, keep := splitCompleteRawLines(pending)
+			for _, rawLine := range lines {
+				line := decodeLikelyText(rawLine)
 				line = strings.TrimRight(line, "\r\n")
 				if strings.TrimSpace(line) == "" {
 					continue
@@ -49,12 +48,7 @@ func (c *Client) readOutput(r io.Reader) {
 				}
 			}
 
-			// This is intentionally simple. For production, keep undecoded trailing bytes.
-			if keep == "" {
-				pending = pending[:0]
-			} else {
-				pending = utf16LEBytes(keep)
-			}
+			pending = keep
 		}
 
 		if err != nil {
@@ -114,26 +108,37 @@ func decodeLikelyText(b []byte) string {
 	return string(b)
 }
 
-func splitCompleteLines(s string) ([]string, string) {
-	if s == "" {
-		return nil, ""
+func splitCompleteRawLines(b []byte) ([][]byte, []byte) {
+	if len(b) == 0 {
+		return nil, nil
 	}
 
-	parts := strings.SplitAfter(s, "\n")
-	if len(parts) == 0 {
-		return nil, ""
-	}
-
-	var lines []string
-	for _, p := range parts {
-		if strings.HasSuffix(p, "\n") {
-			lines = append(lines, p)
-		} else {
-			return lines, p
+	var lines [][]byte
+	start := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\n' {
+			continue
 		}
+
+		end := i + 1
+		if end < len(b) && b[end] == 0x00 {
+			end++
+		}
+
+		line := make([]byte, end-start)
+		copy(line, b[start:end])
+		lines = append(lines, line)
+		start = end
+		i = end - 1
 	}
 
-	return lines, ""
+	if start == len(b) {
+		return lines, nil
+	}
+
+	keep := make([]byte, len(b)-start)
+	copy(keep, b[start:])
+	return lines, keep
 }
 
 func isExpectedProcessExit(err error) bool {

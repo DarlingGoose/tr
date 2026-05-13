@@ -46,9 +46,14 @@ func (c *Client) HookHistories() map[string][]*Line {
 
 func (c *Client) HookFeed(ctx context.Context, group string, replayHistory bool) <-chan *Line {
 	group = HookGroup(group)
-	out := make(chan *Line, 256)
 
 	c.hookMu.Lock()
+	bufferSize := 256
+	if replayHistory {
+		bufferSize = max(bufferSize, c.hookHistoryReplaySizeLocked(group))
+	}
+
+	out := make(chan *Line, bufferSize)
 	if replayHistory {
 		c.replayHookHistoryLocked(out, group)
 	}
@@ -71,6 +76,18 @@ func (c *Client) HookFeed(ctx context.Context, group string, replayHistory bool)
 	}()
 
 	return out
+}
+
+func (c *Client) hookHistoryReplaySizeLocked(group string) int {
+	if group != "" {
+		return len(c.hookHistory[group])
+	}
+
+	size := 0
+	for _, lines := range c.hookHistory {
+		size += len(lines)
+	}
+	return size
 }
 
 func (c *Client) replayHookHistoryLocked(out chan<- *Line, group string) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -89,6 +90,32 @@ func TestHookFeedReplaysAndStreamsSelectedGroup(t *testing.T) {
 	cancel()
 	if _, ok := <-feed; ok {
 		t.Fatal("expected feed to close after cancel")
+	}
+}
+
+func TestHookFeedReplaysAllHistoryBeyondDefaultBuffer(t *testing.T) {
+	client := newTestClient(t, 1)
+
+	const want = 300
+	for i := range want {
+		client.recordHookLine(&Line{
+			Hook: "Thread A@hook-" + strconv.Itoa(i),
+			Text: "line",
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	feed := client.HookFeed(ctx, "", true)
+	seen := make(map[string]struct{}, want)
+	for range want {
+		line := readFeedLine(t, feed)
+		seen[line.HookGroup()] = struct{}{}
+	}
+
+	if len(seen) != want {
+		t.Fatalf("expected %d replayed hook groups, got %d", want, len(seen))
 	}
 }
 

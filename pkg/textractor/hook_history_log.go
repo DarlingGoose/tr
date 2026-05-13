@@ -21,6 +21,7 @@ type hookHistoryLogEntry struct {
 	Hook      string    `json:"hook"`
 	Speaker   string    `json:"speaker,omitempty"`
 	Text      string    `json:"text"`
+	Raw       string    `json:"raw"`
 }
 
 type hookHistoryLogEvent struct {
@@ -155,6 +156,7 @@ func (l *hookHistoryLogger) run() {
 			HookGroup: event.group,
 			Hook:      event.line.Hook,
 			Speaker:   event.line.Speaker,
+			Raw:       event.line.Raw,
 			Text:      event.line.Text,
 		}
 		b, err := json.Marshal(entry)
