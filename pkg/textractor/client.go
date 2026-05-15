@@ -304,6 +304,14 @@ func (c *Client) Lines() <-chan *Line {
 	return SpeakerMergedLines(c.lines)
 }
 
+func (c *Client) BestDialogueLines() <-chan *Line {
+	return BestDialogueLines(SpeakerMergedLines(c.lines))
+}
+
+func (c *Client) BestDialogueLinesWithOptions(opts DialogueSelectorOptions) <-chan *Line {
+	return BestDialogueLinesWithOptions(SpeakerMergedLines(c.lines), opts)
+}
+
 func (c *Client) Errors() <-chan error {
 	return c.errs
 }

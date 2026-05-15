@@ -108,6 +108,30 @@ merging. The merger:
 
 Use `RawLines()` if you need unmerged Textractor output.
 
+## Best Dialogue Selection
+
+Some games emit good text from more than one hook, or occasionally produce junk
+from an otherwise useful hook. Use `BestDialogueLines` to listen across hooks and
+emit the best readable line from each short burst:
+
+```go
+lines := client.BestDialogueLines()
+for line := range lines {
+	fmt.Printf("%s: %s\n", line.Speaker, line.Text)
+}
+```
+
+The selector waits briefly for competing hooks, scores candidate lines, rejects
+obvious junk, prefers complete quoted dialogue, and suppresses shorter duplicate
+fragments after a full line was emitted. Tune the wait window if a game emits
+alternate hooks more slowly:
+
+```go
+lines := client.BestDialogueLinesWithOptions(textractor.DialogueSelectorOptions{
+	SelectionWindow: 150 * time.Millisecond,
+})
+```
+
 ## Hook History And Live Feeds
 
 The client records recent lines per hook group while it reads Textractor output.

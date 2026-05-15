@@ -120,6 +120,10 @@ func splitCompleteRawLines(b []byte) ([][]byte, []byte) {
 			continue
 		}
 
+		if likelyUTF16LEPrefix(b[start:i+1]) && i+1 == len(b) {
+			break
+		}
+
 		end := i + 1
 		if end < len(b) && b[end] == 0x00 {
 			end++
@@ -139,6 +143,26 @@ func splitCompleteRawLines(b []byte) ([][]byte, []byte) {
 	keep := make([]byte, len(b)-start)
 	copy(keep, b[start:])
 	return lines, keep
+}
+
+func likelyUTF16LEPrefix(b []byte) bool {
+	if len(b) >= 2 && b[0] == 0xff && b[1] == 0xfe {
+		return true
+	}
+	if len(b) < 4 {
+		return false
+	}
+
+	var zeros int
+	var pairs int
+	for i := 1; i < len(b); i += 2 {
+		pairs++
+		if b[i] == 0 {
+			zeros++
+		}
+	}
+
+	return pairs > 0 && zeros*100/pairs > 40
 }
 
 func isExpectedProcessExit(err error) bool {
